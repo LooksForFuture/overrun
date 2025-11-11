@@ -1,34 +1,38 @@
-#include "ecs.h"
+#include <ecs.h>
 
+#include <assert.h>
 #include <stdio.h>
 
-typedef struct {
-	float x, y;
-} Transform;
-
-typedef struct {
-	int index; //sprite index
-} Render;
+// --- Components
+typedef struct { float x, y; } Transform;
+typedef struct { float vx, vy; } Velocity;
+typedef struct { int sprite; } Render;
 
 ECS_DECL_COMP(Transform);
+ECS_DECL_COMP(Velocity);
 ECS_DECL_COMP(Render);
 
-Archetype *Ship;
+Archetype *ship;
+Archetype *bullet;
 
 int main(void)
 {
 	ecs_init();
 
 	ECS_REG_COMP(Transform);
+	ECS_REG_COMP(Velocity);
 	ECS_REG_COMP(Render);
 
-	Ship = ECS_REG_ARCH(Transform, Render);
-	Entity ent1 = ecs_newEntity(Ship);
-	printf("%ld\n", ent1);
-	Entity ent2 = ecs_newEntity(Ship);
-	printf("%ld\n", ent2);
-	Entity ent3 = ecs_newEntity(Ship);
-	printf("%ld\n", ent3);
+	ship = ECS_REG_ARCH(Transform, Render);
+	assert(ship != NULL);
+	bullet = ECS_REG_ARCH(Transform, Render, Velocity);
+	assert(bullet != NULL);
+
+	Entity ent = ecs_newEntityInArch(ship);
+	assert(ecs_getEntityArch(ent) == ship);
+
+	ECS_ADD_COMPONENT(ent, Velocity);
+	assert(ecs_getEntityArch(ent) == bullet);
 
 	ecs_shutdown();
 }
