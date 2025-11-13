@@ -1,6 +1,7 @@
 #include <ecs.h>
 
 #include <zoner/zon_arena.h>
+#include <zoner/zon_flpool.h>
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -10,8 +11,6 @@
 #define MAX_COMPONENT_COUNT 1024
 #define MAX_ARCHETYPE_COUNT 128
 #define MAX_ARCH_ENTITY 256
-#define MAX_QUERY_ARCH 32
-#define MAX_QUERY_COUNT 512
 
 #define CREATE_ENTITY(i, g) (((uint64_t)(i) << 32) | (g))
 
@@ -25,6 +24,7 @@ struct Archetype {
 	void *storage[8];
 	int compCount;
 	Entity entities[MAX_ARCH_ENTITY];
+	ZonFLPool indexPool; //for recording free indices
 	int entCount;
 };
 
@@ -40,6 +40,7 @@ static ZonArena ecsStorage;
 // number of alive entities
 static int entCount = 0;
 static EntityDesc entDescs[MAX_ENTITY_COUNT];
+static uint32_t nextFreeEntity = 0;
 
 static int compCount = 0;
 static ComponentDesc compDescs[MAX_COMPONENT_COUNT];
@@ -51,9 +52,14 @@ Archetype *emptyArch = NULL; //empty arch for empty entities
 
 void ecs_init(void)
 {
-	for (int i = 0; i < MAX_ENTITY_COUNT; i++) {
-		entDescs[i].id = CREATE_ENTITY(i, 0);
+	for (uint32_t i = 0; i < MAX_ENTITY_COUNT - 1; i++) {
+		entDescs[i].id = CREATE_ENTITY(i+1, 0);
 	}
+	entDescs[MAX_ENTITY_COUNT-1].id = CREATE_ENTITY(UINT32_MAX, 0);
+
+	nextFreeEntity = 0;
+	entCount = 0;
+
 	ecsStorage = zon_arenaCreate(malloc(65536), 65536);
 	emptyArch = ecs_registerArchetype(NULL, 0);
 }
@@ -81,18 +87,28 @@ Archetype *ecs_registerArchetype(EcsComponent *components, size_t count)
 	//sort components for faster iteration
 	qsort(components, count, sizeof(EcsComponent), comparComponent);
 
-	Archetype *archetype = &archetypes[archCount++];
+	Archetype *arch = &archetypes[archCount++];
 	for (size_t i = 0; i < count; i++) {
 		const ComponentDesc desc = compDescs[components[i]];
-		archetype->componentIds[i] = components[i];
-		archetype->storage[i] =
+		arch->componentIds[i] = components[i];
+		arch->storage[i] =
 			zon_arenaMalloc(&ecsStorage,
 					MAX_ARCH_ENTITY * desc.size);
 	}
-	archetype->compCount = count;
-	archetype->entCount = 0;
+	arch->compCount = count;
+	arch->entCount = 0;
 
-	return archetype;
+	arch->indexPool = zon_flpoolCreate(arch->entities,
+					   sizeof(Entity), MAX_ARCH_ENTITY);
+
+	return arch;
+}
+
+bool ecs_isValid(Entity ent)
+{
+	uint32_t index = ECS_ENTITY_INDEX(ent);
+	uint32_t gen = ECS_ENTITY_GENERATION(ent);
+	return ECS_ENTITY_GENERATION(entDescs[index].id) == gen;
 }
 
 Entity ecs_newEntity(void) {
@@ -101,18 +117,38 @@ Entity ecs_newEntity(void) {
 
 Entity ecs_newEntityInArch(Archetype *arch)
 {
-	EntityDesc *desc = &entDescs[entCount];
-	uint32_t index = ECS_ENTITY_INDEX(desc->id);
+	uint32_t currentFree = nextFreeEntity;
+	EntityDesc *desc = &entDescs[currentFree];
+	nextFreeEntity = ECS_ENTITY_INDEX(desc->id);
+
 	uint32_t generation = ECS_ENTITY_GENERATION(desc->id);
-	desc->id = CREATE_ENTITY(index, generation + 1);
+	desc->id = CREATE_ENTITY(currentFree, generation + 1);
 	entCount++;
 
-	arch->entities[arch->entCount] = desc->id;
+	Entity *slot = zon_flpoolPop(&arch->indexPool);
+	int index = (int)(slot - arch->entities);
+	arch->entities[index] = desc->id;
 	desc->arch = arch;
-	desc->index = arch->entCount;
+	desc->index = index;
 	arch->entCount++;
 
 	return desc->id;
+}
+
+void ecs_destroyEntity(Entity ent)
+{
+	uint32_t index = ECS_ENTITY_INDEX(ent);
+	uint32_t gen = ECS_ENTITY_GENERATION(ent);
+	EntityDesc *desc = &entDescs[index];
+	if (ECS_ENTITY_GENERATION(desc->id) != gen) return;
+
+	Archetype *arch = desc->arch;
+	zon_flpoolPush(&arch->indexPool, &arch->entities[desc->index]);
+	arch->entCount--;
+	desc->arch = NULL;
+
+	desc->id = CREATE_ENTITY(nextFreeEntity, gen + 1);
+	nextFreeEntity = index;
 }
 
 Archetype *ecs_getEntityArch(Entity ent) {
@@ -170,7 +206,10 @@ void *ecs_addComponent(Entity ent, EcsComponent comp)
 
 	//copy data from old to new archetype
 	int oldIndex = entDescs[index].index;
-	int newIndex = newArch->entCount++;
+	Entity *slot = zon_flpoolPop(&newArch->indexPool);
+	int newIndex = (int)(slot - newArch->entities);
+	newArch->entCount++;
+
 	//--- before insertPos
 	for (int i = 0; i < insertPos; i++) {
 		size_t size = compDescs[oldArch->componentIds[i]].size;
@@ -191,6 +230,10 @@ void *ecs_addComponent(Entity ent, EcsComponent comp)
 	size_t newSize = compDescs[comp].size;
 	uint8_t* newCompPtr = (uint8_t*)newArch->storage[insertPos] + newIndex * newSize;
 	memset(newCompPtr, 0, newSize);
+
+	//remove entity index from old archetype
+	zon_flpoolPush(&oldArch->indexPool, &oldArch->entities[oldIndex]);
+	oldArch->entCount--;
 
 	//update entity metadata
 	newArch->entities[newIndex] = ent;

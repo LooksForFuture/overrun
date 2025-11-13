@@ -4,6 +4,7 @@
 #include <map.h>
 
 #include <stdalign.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -43,11 +44,17 @@ void ecs_shutdown(void);
 /* register a component (returns an id) */
 EcsComponent ecs_registerComponent(size_t, size_t);
 
-/* create or find an archetyoe with the specified components */
+/* create an archetyoe with the specified set of components */
 Archetype *ecs_registerArchetype(EcsComponent *, size_t);
+
+/* checks if an entity is invalid (still alive?) */
+bool ecs_isValid(Entity);
 
 /* create an empty entity */
 Entity ecs_newEntity(void);
+
+/* destroy and entity (makes it invalid) */
+void ecs_destroyEntity(Entity);
 
 /* create an entity in the specified archetype */
 Entity ecs_newEntityInArch(Archetype *);

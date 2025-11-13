@@ -34,5 +34,9 @@ int main(void)
 	ECS_ADD_COMPONENT(ent, Velocity);
 	assert(ecs_getEntityArch(ent) == bullet);
 
+	ecs_destroyEntity(ent);
+	assert(!ecs_isValid(ent));
+	assert(ecs_getEntityArch(ent) == NULL);
+
 	ecs_shutdown();
 }
