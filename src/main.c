@@ -38,5 +38,7 @@ int main(void)
 	assert(!ecs_isValid(ent));
 	assert(ecs_getEntityArch(ent) == NULL);
 
+	EcsQuery *q = ECS_QUERY(ECS_ACCESS(include, Transform, Render));
+
 	ecs_shutdown();
 }
