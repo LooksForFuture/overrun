@@ -30,7 +30,7 @@ MAP_COUNT(__VA_ARGS__))
 
 #define ECS_ACCESS(type, ...) .type = (EcsComponent[]){ \
 	MAP_LIST(ECS_ID, __VA_ARGS__) \
-	}, .type##Count = MAP_COUNT(__VA_ARGS__),
+	}, .type##Count = MAP_COUNT(__VA_ARGS__)
 
 typedef uint64_t Entity;
 typedef uint32_t EcsComponent;
@@ -47,6 +47,13 @@ typedef struct {
 	EcsComponent *exclude;
 	int excludeCount;
 } EcsQueryDesc;
+
+typedef struct {
+	EcsQuery *query;
+	Entity entity;
+	int archIndex;
+	int slot;
+} EcsIter;
 
 /* initialize ecs */
 void ecs_init(void);
@@ -80,5 +87,11 @@ void *ecs_addComponent(Entity, EcsComponent);
 
 /* make a query based on the defined accesses */
 EcsQuery *ecs_makeQuery(EcsQueryDesc);
+
+/* make an iterator for getting entities from query */
+EcsIter ecs_queryIter(EcsQuery *);
+
+/* iterates over the query and checks if an entity is available */
+bool ecs_iterNext(EcsIter *);
 
 #endif //__ECS_MAIN__

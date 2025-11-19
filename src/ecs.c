@@ -9,9 +9,13 @@
 #define MAX_ENTITY_COUNT 1024
 #define MAX_COMPONENT_COUNT 1024
 #define MAX_ARCHETYPE_COUNT 128
+#define MAX_QUERY_COUNT 64
 #define MAX_ARCH_ENTITY 256
 
 #define CREATE_ENTITY(i, g) (((uint64_t)(i) << 32) | (g))
+
+//a bitmask with each bit representing a component
+typedef uint64_t EcsMask;
 
 typedef struct {
 	size_t size;
@@ -22,6 +26,7 @@ struct Archetype {
 	EcsComponent componentIds[8];
 	void *storage[8];
 	int compCount;
+	EcsMask mask;
 	Entity entities[MAX_ARCH_ENTITY];
 	int entCount;
 };
@@ -33,7 +38,9 @@ typedef struct {
 } EntityDesc;
 
 struct EcsQuery {
-	Archetype matches[32];
+	EcsMask include;
+	EcsMask exclude;
+	Archetype *matches[32];
 	int matchCount;
 };
 
@@ -50,6 +57,9 @@ static ComponentDesc compDescs[MAX_COMPONENT_COUNT];
 
 static int archCount = 0;
 static Archetype archetypes[MAX_ARCHETYPE_COUNT];
+
+static int queryCount = 0;
+static EcsQuery queries[MAX_QUERY_COUNT];
 
 Archetype *emptyArch = NULL; //empty arch for empty entities
 
@@ -90,15 +100,26 @@ Archetype *ecs_registerArchetype(EcsComponent *components, size_t count)
 	qsort(components, count, sizeof(EcsComponent), comparComponent);
 
 	Archetype *arch = &archetypes[archCount++];
+	arch->mask = 0;
 	for (size_t i = 0; i < count; i++) {
-		const ComponentDesc desc = compDescs[components[i]];
-		arch->componentIds[i] = components[i];
+		EcsComponent comp = components[i];
+		const ComponentDesc desc = compDescs[comp];
+		arch->componentIds[i] = comp;
+		arch->mask |= (1ULL << comp);
 		arch->storage[i] =
 			zon_arenaMalloc(&ecsStorage,
 					MAX_ARCH_ENTITY * desc.size);
 	}
 	arch->compCount = count;
 	arch->entCount = 0;
+
+	for (int i = 0; i < queryCount; i++) {
+		EcsQuery *q = &queries[i];
+		if ((arch->mask & q->include) == q->include &&
+		    (arch->mask & q->exclude) == 0) {
+			q->matches[q->matchCount++] = arch;
+		}
+	}
 
 	return arch;
 }
@@ -174,45 +195,48 @@ void *ecs_addComponent(Entity ent, EcsComponent comp)
 	int oldCount = oldArch->compCount;
 
 	// check if the component is already present
-	for (int i = 0; i < oldCount; i++) {
-		if (oldArch->componentIds[i] == comp) {
-			size_t size = compDescs[comp].size;
-			return (uint8_t*)oldArch->storage[i] +
-			       entDescs[index].slot + size;
+	EcsMask mask = (1ULL << comp);
+	if ((mask & oldArch->mask) == mask) {
+		for (int i = 0; i < oldCount; i++) {
+			if (oldArch->componentIds[i] == comp) {
+				size_t size = compDescs[comp].size;
+				return (uint8_t*)oldArch->storage[i] +
+				       entDescs[index].slot * size;
+			}
 		}
 	}
 
 	int newCount = oldCount + 1;
-	size_t marker = zon_arenaMarker(&ecsStorage);
-	EcsComponent *ids = zon_arenaMalloc(&ecsStorage, newCount * sizeof(EcsComponent));
+	mask = oldArch->mask | (1ULL << comp);
 
 	int insertPos = 0;
 	while (insertPos < oldCount &&
 	       oldArch->componentIds[insertPos] < comp) insertPos++;
 
-	//copy before insertPos
-	if (insertPos > 0)
-		memcpy(ids, oldArch->componentIds,
-		       insertPos * sizeof(EcsComponent));
-	ids[insertPos] = comp;
-	if (oldCount - insertPos > 0)
-		memcpy(ids + insertPos + 1,
-		       oldArch->componentIds + insertPos,
-		       (oldCount - insertPos) * sizeof(EcsComponent));
-
 	//find or create archetype
 	Archetype *newArch = NULL;
 	for (int i = 0; i < archCount; i++) {
 		Archetype *arch = &archetypes[i];
-		if (arch->compCount == newCount &&
-		    memcmp(arch->componentIds, ids,
-			   newCount * sizeof(EcsComponent)) == 0) {
+		if (arch->mask == mask) {
 			newArch = arch;
 			break;
 		}
 	}
-	if (!newArch)
+	if (!newArch) {
+		size_t marker = zon_arenaMarker(&ecsStorage);
+		EcsComponent *ids = zon_arenaMalloc(&ecsStorage, newCount * sizeof(EcsComponent));
+		//copy before insertPos
+		if (insertPos > 0)
+			memcpy(ids, oldArch->componentIds,
+			       insertPos * sizeof(EcsComponent));
+		ids[insertPos] = comp;
+		if (oldCount - insertPos > 0)
+			memcpy(ids + insertPos + 1,
+			       oldArch->componentIds + insertPos,
+			       (oldCount - insertPos) * sizeof(EcsComponent));
 		newArch = ecs_registerArchetype(ids, newCount);
+		zon_arenaRewind(&ecsStorage, marker);
+	}
 
 	//copy data from old to new archetype
 	int oldSlot = entDescs[index].slot;
@@ -239,7 +263,6 @@ void *ecs_addComponent(Entity ent, EcsComponent comp)
 
 	//remove entity index from old archetype
 	int last = --oldArch->entCount;
-
 	if (oldSlot != last) {
 		Entity lastEnt = oldArch->entities[last];
 		oldArch->entities[oldSlot] = lastEnt;
@@ -258,11 +281,59 @@ void *ecs_addComponent(Entity ent, EcsComponent comp)
 	entDescs[index].arch = newArch;
 	entDescs[index].slot = newSlot;
 
-	zon_arenaRewind(&ecsStorage, marker);
 	return (void*)newCompPtr;
 }
 
-EcsQuery *ecs_makeQuery(EcsQueryDesc qDesc)
+EcsQuery *ecs_makeQuery(EcsQueryDesc desc)
 {
-	return NULL;
+	EcsQuery *q = &queries[queryCount++];
+	q->include = 0;
+	q->exclude = 0;
+	q->matchCount = 0;
+
+	for (int i = 0; i < desc.includeCount; i++)
+		q->include |= (1ULL << desc.include[i]);
+	for (int i = 0; i < desc.excludeCount; i++)
+		q->exclude |= (1ULL << desc.exclude[i]);
+
+	for (int i = 0; i < archCount; i++) {
+		Archetype *arch = &archetypes[i];
+		if ((arch->mask & q->include) == q->include &&
+		    (arch->mask & q->exclude) == 0) {
+			q->matches[q->matchCount++] = arch;
+		}
+	}
+
+	return q;
+}
+
+EcsIter ecs_queryIter(EcsQuery *q)
+{
+	EcsIter it = {
+		.query = q,
+		.archIndex = 0,
+		.slot = -1,
+	};
+
+	return it;
+}
+
+bool ecs_iterNext(EcsIter *it)
+{
+	if (!it->query) return false;
+	EcsQuery *q = it->query;
+
+	while (it->archIndex < q->matchCount) {
+		it->slot++;
+		if (it->slot == q->matches[it->archIndex]->entCount) {
+			it->slot = -1;
+			it->archIndex++;
+			continue;
+		}
+
+		it->entity = q->matches[it->archIndex]->entities[it->slot];
+		return true;
+	}
+
+	return false;
 }
