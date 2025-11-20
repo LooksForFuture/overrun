@@ -7,7 +7,7 @@
 #include <string.h>
 
 #define MAX_ENTITY_COUNT 1024
-#define MAX_COMPONENT_COUNT 1024
+#define MAX_COMPONENT_COUNT 64
 #define MAX_ARCHETYPE_COUNT 128
 #define MAX_QUERY_COUNT 64
 #define MAX_ARCH_ENTITY 256
@@ -25,6 +25,7 @@ typedef struct {
 struct Archetype {
 	EcsComponent componentIds[8];
 	void *storage[8];
+	int compIndexCache[MAX_COMPONENT_COUNT];
 	int compCount;
 	EcsMask mask;
 	Entity entities[MAX_ARCH_ENTITY];
@@ -42,6 +43,8 @@ struct EcsQuery {
 	EcsMask exclude;
 	Archetype *matches[32];
 	int matchCount;
+	EcsComponent includeList[8];
+	int includeCount;
 };
 
 // where we store ECS data and free on shutdown
@@ -101,6 +104,7 @@ Archetype *ecs_registerArchetype(EcsComponent *components, size_t count)
 
 	Archetype *arch = &archetypes[archCount++];
 	arch->mask = 0;
+	memset(arch->compIndexCache, -1, sizeof(arch->compIndexCache));
 	for (size_t i = 0; i < count; i++) {
 		EcsComponent comp = components[i];
 		const ComponentDesc desc = compDescs[comp];
@@ -109,6 +113,7 @@ Archetype *ecs_registerArchetype(EcsComponent *components, size_t count)
 		arch->storage[i] =
 			zon_arenaMalloc(&ecsStorage,
 					MAX_ARCH_ENTITY * desc.size);
+		arch->compIndexCache[comp] = i;
 	}
 	arch->compCount = count;
 	arch->entCount = 0;
@@ -284,15 +289,33 @@ void *ecs_addComponent(Entity ent, EcsComponent comp)
 	return (void*)newCompPtr;
 }
 
+void *ecs_getComponent(Entity ent, EcsComponent comp)
+{
+	uint32_t index = ECS_ENTITY_INDEX(ent);
+	if (entDescs[index].id != ent) return NULL;
+
+	Archetype *arch = entDescs[index].arch;
+	int slot = entDescs[index].slot;
+
+	int cidx = arch->compIndexCache[comp];
+	if (cidx < 0) return NULL; //component not in arch
+
+	size_t size = compDescs[comp].size;
+	return (uint8_t*)arch->storage[cidx] + slot * size;
+}
+
 EcsQuery *ecs_makeQuery(EcsQueryDesc desc)
 {
 	EcsQuery *q = &queries[queryCount++];
 	q->include = 0;
 	q->exclude = 0;
 	q->matchCount = 0;
+	q->includeCount = desc.includeCount;
 
-	for (int i = 0; i < desc.includeCount; i++)
+	for (int i = 0; i < desc.includeCount; i++) {
 		q->include |= (1ULL << desc.include[i]);
+		q->includeList[i] = desc.include[i];
+	}
 	for (int i = 0; i < desc.excludeCount; i++)
 		q->exclude |= (1ULL << desc.exclude[i]);
 
@@ -324,14 +347,23 @@ bool ecs_iterNext(EcsIter *it)
 	EcsQuery *q = it->query;
 
 	while (it->archIndex < q->matchCount) {
+		Archetype *arch = q->matches[it->archIndex];
 		it->slot++;
-		if (it->slot == q->matches[it->archIndex]->entCount) {
-			it->slot = -1;
+		if (it->slot >= arch->entCount) {
 			it->archIndex++;
+			it->slot = -1;
 			continue;
 		}
 
-		it->entity = q->matches[it->archIndex]->entities[it->slot];
+		it->entity = arch->entities[it->slot];
+		for (int i = 0; i < q->includeCount; i++) {
+			EcsComponent comp = q->includeList[i];
+			int cidx = arch->compIndexCache[comp];
+			size_t size = compDescs[comp].size;
+			it->includes[i] = (uint8_t*)arch->storage[cidx] +
+					  it->slot * size;
+		}
+
 		return true;
 	}
 

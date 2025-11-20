@@ -26,6 +26,9 @@ MAP_COUNT(__VA_ARGS__))
 #define ECS_ADD_COMPONENT(entity, component) \
 (component*)ecs_addComponent(entity, ECS_ID(component))
 
+#define ECS_GET_COMPONENT(entity, component) \
+(component*)ecs_getComponent(entity, ECS_ID(component))
+
 #define ECS_QUERY(...) ecs_makeQuery((EcsQueryDesc){__VA_ARGS__})
 
 #define ECS_ACCESS(type, ...) .type = (EcsComponent[]){ \
@@ -33,7 +36,7 @@ MAP_COUNT(__VA_ARGS__))
 	}, .type##Count = MAP_COUNT(__VA_ARGS__)
 
 typedef uint64_t Entity;
-typedef uint32_t EcsComponent;
+typedef uint64_t EcsComponent;
 
 struct Archetype;
 typedef struct Archetype Archetype;
@@ -53,6 +56,7 @@ typedef struct {
 	Entity entity;
 	int archIndex;
 	int slot;
+	void *includes[8];
 } EcsIter;
 
 /* initialize ecs */
@@ -84,6 +88,9 @@ Archetype *ecs_getEntityArch(Entity);
 
 /* add a component to an entity (changes archetype) */
 void *ecs_addComponent(Entity, EcsComponent);
+
+/* get component if available */
+void *ecs_getComponent(Entity, EcsComponent);
 
 /* make a query based on the defined accesses */
 EcsQuery *ecs_makeQuery(EcsQueryDesc);

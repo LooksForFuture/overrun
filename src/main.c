@@ -29,27 +29,15 @@ int main(void)
 	assert(bullet != NULL);
 
 	Entity ent = ecs_newEntityInArch(ship);
-	assert(ecs_getEntityArch(ent) == ship);
-
-	Velocity *v = ECS_ADD_COMPONENT(ent, Velocity);
-	assert(ecs_getEntityArch(ent) == bullet);
-	assert(ECS_ADD_COMPONENT(ent, Velocity) == v);
-
-	ecs_destroyEntity(ent);
-	assert(!ecs_isValid(ent));
-	assert(ecs_getEntityArch(ent) == NULL);
-
-	ent = ecs_newEntityInArch(ship);
 	Transform *t = ECS_ADD_COMPONENT(ent, Transform);
 	t->x = 112.0f;
 	t->y = 99.0f;
 
 	EcsQuery *q = ECS_QUERY(ECS_ACCESS(include, Transform, Render));
-
 	EcsIter it = ecs_queryIter(q);
 	while (ecs_iterNext(&it)) {
 		Entity ent = it.entity;
-		Transform *t = ECS_ADD_COMPONENT(ent, Transform);
+		Transform *t = it.includes[0];
 		printf("%f %f\n", t->x, t->y);
 	}
 
