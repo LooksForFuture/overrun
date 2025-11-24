@@ -3,6 +3,7 @@
 #include <zoner/zon_arena.h>
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,6 +14,9 @@
 #define MAX_ARCH_ENTITY 256
 
 #define CREATE_ENTITY(i, g) (((uint64_t)(i) << 32) | (g))
+
+// entity id to bitmask
+#define COMP_BIT(c) (1ULL << (c))
 
 //a bitmask with each bit representing a component
 typedef uint64_t EcsMask;
@@ -47,13 +51,26 @@ struct EcsQuery {
 	int includeCount;
 };
 
+typedef struct {
+	bool active; //already in dirty list?
+	bool destroy; //entity must die
+	EcsMask addMask; //bit mask of components to add
+	EcsMask remMask; //bit mask of components to remove
+	void *data[64]; //pointer to component staged data
+} CmdBucket;
+
 // where we store ECS data and free on shutdown
 static ZonArena ecsStorage;
+// for storing staged components data
+static ZonArena cmdStorage;
 
-// number of alive entities
-static int entCount = 0;
+static int entCount = 0; // number of alive entities
 static EntityDesc entDescs[MAX_ENTITY_COUNT];
 static uint32_t nextFreeEntity = 0;
+static CmdBucket cmdBuckets[MAX_ENTITY_COUNT];
+//entities to be processed at flush
+static uint32_t dirties[MAX_ENTITY_COUNT];
+static size_t dirtyCount = 0;
 
 static int compCount = 0;
 static ComponentDesc compDescs[MAX_COMPONENT_COUNT];
@@ -64,24 +81,33 @@ static Archetype archetypes[MAX_ARCHETYPE_COUNT];
 static int queryCount = 0;
 static EcsQuery queries[MAX_QUERY_COUNT];
 
-Archetype *emptyArch = NULL; //empty arch for empty entities
+static bool inDeferred = false;
+
+static Archetype *emptyArch = NULL; //empty arch for empty entities
 
 void ecs_init(void)
 {
 	for (uint32_t i = 0; i < MAX_ENTITY_COUNT; i++) {
-		entDescs[i].id = CREATE_ENTITY(i, 0);
+		entDescs[i].id = CREATE_ENTITY(i + 1, 0);
+		entDescs[i].arch = NULL;
+		entDescs[i].slot = -1;
 	}
 
+	entDescs[MAX_ENTITY_COUNT - 1].id =
+		CREATE_ENTITY(UINT32_MAX, 0);
 	nextFreeEntity = 0;
 	entCount = 0;
+	dirtyCount = 0;
 
 	ecsStorage = zon_arenaCreate(malloc(65536), 65536);
+	cmdStorage = zon_arenaCreate(malloc(65536), 65536);
 	emptyArch = ecs_registerArchetype(NULL, 0);
 }
 
 void ecs_shutdown(void)
 {
 	free(zon_arenaUnlock(&ecsStorage));
+	free(zon_arenaUnlock(&cmdStorage));
 }
 
 EcsComponent ecs_registerComponent(size_t size, size_t alignment)
@@ -94,22 +120,29 @@ EcsComponent ecs_registerComponent(size_t size, size_t alignment)
 
 static int comparComponent(const void *a, const void *b)
 {
-	return (*(EcsComponent *)a - *(EcsComponent *)b);
+    EcsComponent ca = *(const EcsComponent *)a;
+    EcsComponent cb = *(const EcsComponent *)b;
+    if (ca < cb) return -1;
+    if (ca > cb) return 1;
+    return 0;
 }
 
 Archetype *ecs_registerArchetype(EcsComponent *components, size_t count)
 {
 	//sort components for faster iteration
-	qsort(components, count, sizeof(EcsComponent), comparComponent);
+	if (count > 0 && components != NULL)
+		qsort(components, count, sizeof(EcsComponent), comparComponent);
 
 	Archetype *arch = &archetypes[archCount++];
 	arch->mask = 0;
-	memset(arch->compIndexCache, -1, sizeof(arch->compIndexCache));
-	for (size_t i = 0; i < count; i++) {
+	for (int i = 0; i < MAX_COMPONENT_COUNT; ++i)
+		arch->compIndexCache[i] = -1;
+
+	for (int i = 0; i < count; i++) {
 		EcsComponent comp = components[i];
 		const ComponentDesc desc = compDescs[comp];
 		arch->componentIds[i] = comp;
-		arch->mask |= (1ULL << comp);
+		arch->mask |= COMP_BIT(comp);
 		arch->storage[i] =
 			zon_arenaMalloc(&ecsStorage,
 					MAX_ARCH_ENTITY * desc.size);
@@ -134,18 +167,36 @@ bool ecs_isValid(Entity ent)
 	return entDescs[ECS_ENTITY_INDEX(ent)].id == ent;
 }
 
-Entity ecs_newEntity(void) {
+Archetype *ecs_getEntityArch(Entity ent)
+{
+	return entDescs[ECS_ENTITY_INDEX(ent)].arch;
+}
+
+Entity ecs_newEntity(void)
+{
 	return ecs_newEntityInArch(emptyArch);
 }
 
+
 Entity ecs_newEntityInArch(Archetype *arch)
 {
+	// Ensure the free-list head is valid
+	if (nextFreeEntity == UINT32_MAX) {
+		fprintf(stderr, "ecs_newEntityInArch: out of entity slots\n");
+		exit(1);
+	}
+	
 	uint32_t currentFree = nextFreeEntity;
 	EntityDesc *desc = &entDescs[currentFree];
 	nextFreeEntity = ECS_ENTITY_INDEX(desc->id);
 
 	uint32_t generation = ECS_ENTITY_GENERATION(desc->id);
 	desc->id = CREATE_ENTITY(currentFree, generation + 1);
+
+	if (arch->entCount >= MAX_ARCH_ENTITY) {
+		fprintf(stderr, "ecs_newEntityInArch: archetype full (max %d)\n", MAX_ARCH_ENTITY);
+		exit(1);
+	}
 	entCount++;
 
 	int slot = arch->entCount;
@@ -157,12 +208,20 @@ Entity ecs_newEntityInArch(Archetype *arch)
 	return desc->id;
 }
 
-void ecs_destroyEntity(Entity ent)
+static void markBucketDirty(uint32_t entIndex)
+{
+	CmdBucket *buck = &cmdBuckets[entIndex];
+	if (!buck->active) {
+		buck->active = true;
+		dirties[dirtyCount++] = entIndex;
+	}
+}
+
+static void ecs_destroyImmediate(Entity ent)
 {
 	uint32_t index = ECS_ENTITY_INDEX(ent);
 	uint32_t gen = ECS_ENTITY_GENERATION(ent);
 	EntityDesc *desc = &entDescs[index];
-	if (desc->id != ent) return;
 
 	Archetype *arch = desc->arch;
 	int slot = desc->slot;
@@ -185,38 +244,54 @@ void ecs_destroyEntity(Entity ent)
 	desc->id = CREATE_ENTITY(nextFreeEntity, gen+1);
 	desc->slot = -1;
 	nextFreeEntity = index;
+
+	entCount--;
 }
 
-Archetype *ecs_getEntityArch(Entity ent) {
-	return entDescs[ECS_ENTITY_INDEX(ent)].arch;
-}
-
-void *ecs_addComponent(Entity ent, EcsComponent comp)
+static void ecs_destroyDeferred(Entity ent)
 {
 	uint32_t index = ECS_ENTITY_INDEX(ent);
-	if (entDescs[index].id != ent) return NULL;
+	CmdBucket *buck = &cmdBuckets[index];
 
+	//ignore if already schduled to destroy
+	if (buck->destroy) return;
+
+	buck->destroy = true;
+	buck->addMask = 0;
+	buck->remMask = 0;
+
+	markBucketDirty(index);
+}
+
+void ecs_destroy(Entity ent)
+{
+	uint32_t index = ECS_ENTITY_INDEX(ent);
+	if (entDescs[index].id != ent) return;
+
+	if (inDeferred) ecs_destroyDeferred(ent);
+	else ecs_destroyImmediate(ent);
+}
+
+static void *ecs_addComponentImmediate(Entity ent, EcsComponent comp)
+{
+	uint32_t index = ECS_ENTITY_INDEX(ent);
 	Archetype *oldArch = entDescs[index].arch;
 	int oldCount = oldArch->compCount;
 
 	// check if the component is already present
-	EcsMask mask = (1ULL << comp);
-	if ((mask & oldArch->mask) == mask) {
-		for (int i = 0; i < oldCount; i++) {
-			if (oldArch->componentIds[i] == comp) {
-				size_t size = compDescs[comp].size;
-				return (uint8_t*)oldArch->storage[i] +
-				       entDescs[index].slot * size;
-			}
-		}
+	int insertPos = oldArch->compIndexCache[comp];
+	if (insertPos >= 0) {
+		size_t size = compDescs[comp].size;
+		return (uint8_t*)oldArch->storage[insertPos] +
+		       entDescs[index].slot * size;
 	}
 
-	int newCount = oldCount + 1;
-	mask = oldArch->mask | (1ULL << comp);
-
-	int insertPos = 0;
+	insertPos = 0;
 	while (insertPos < oldCount &&
 	       oldArch->componentIds[insertPos] < comp) insertPos++;
+
+	int newCount = oldCount + 1;
+	EcsMask mask = oldArch->mask | COMP_BIT(comp);
 
 	//find or create archetype
 	Archetype *newArch = NULL;
@@ -289,19 +364,269 @@ void *ecs_addComponent(Entity ent, EcsComponent comp)
 	return (void*)newCompPtr;
 }
 
+static void *ecs_addComponentDeferred(Entity ent, EcsComponent comp)
+{
+	uint32_t index = ECS_ENTITY_INDEX(ent);
+	CmdBucket *buck = &cmdBuckets[index];
+
+	// ignore if scheduled to be destroyed
+	if (buck->destroy) return NULL;
+
+	/* if currently has the component and not scheduled
+	   to be removed, return it */
+	Archetype *arch = entDescs[index].arch;
+	int cidx = arch->compIndexCache[comp];
+	if (cidx >= 0) {
+		//has the component
+		//check if not scheduled to be removed
+		if ((buck->remMask & COMP_BIT(comp)) == 0) {
+			size_t sz = compDescs[comp].size;
+			return (uint8_t*)arch->storage[cidx] +
+			       entDescs[index].slot * sz;
+		}
+	}
+
+	//if ADD already staged, return pointer to storage
+	if (buck->addMask & COMP_BIT(comp)) {
+		return buck->data[comp];
+	}
+
+	//Not staged yet. Stage it.
+	size_t sz = compDescs[comp].size;
+	void *buf = zon_arenaMalloc(&cmdStorage, sz);
+	if (!buf) return NULL;
+	buck->data[comp] = buf;
+	buck->addMask |= COMP_BIT(comp);
+	buck->remMask &= ~COMP_BIT(comp);
+
+	markBucketDirty(index);
+	return buf;
+}
+
+void *ecs_addComponent(Entity ent, EcsComponent comp)
+{
+	uint32_t index = ECS_ENTITY_INDEX(ent);
+	if (entDescs[index].id != ent) return NULL;
+
+	if (inDeferred) return ecs_addComponentDeferred(ent, comp);
+	else return ecs_addComponentImmediate(ent, comp);
+}
+
+static void ecs_removeComponentImmediate(Entity ent, EcsComponent comp)
+{
+	uint32_t index = ECS_ENTITY_INDEX(ent);
+	Archetype *oldArch = entDescs[index].arch;
+	int oldCount = oldArch->compCount;
+
+	// check if the component is present
+	int remPos = oldArch->compIndexCache[comp];
+	if (remPos < 0) return;
+
+	remPos = 0;
+	while (remPos < oldCount &&
+	       oldArch->componentIds[remPos] < comp) remPos++;
+
+	int newCount = oldCount - 1;
+	EcsMask mask = oldArch->mask & ~COMP_BIT(comp);
+
+	//find or create archetype
+	Archetype *newArch = NULL;
+	for (int i = 0; i < archCount; i++) {
+		Archetype *arch = &archetypes[i];
+		if (arch->mask == mask) {
+			newArch = arch;
+			break;
+		}
+	}
+	if (!newArch) {
+		size_t marker = zon_arenaMarker(&ecsStorage);
+		EcsComponent *ids = zon_arenaMalloc(&ecsStorage, newCount * sizeof(EcsComponent));
+		//copy before remPos
+		if (remPos > 0)
+			memcpy(ids, oldArch->componentIds,
+			       remPos * sizeof(EcsComponent));
+		if (oldCount - remPos - 1 > 0)
+			memcpy(ids + remPos,
+			       oldArch->componentIds + remPos + 1,
+			       (oldCount - remPos - 1) * sizeof(EcsComponent));
+		newArch = ecs_registerArchetype(ids, newCount);
+		zon_arenaRewind(&ecsStorage, marker);
+	}
+
+	//copy data from old to new archetype
+	int oldSlot = entDescs[index].slot;
+	int newSlot = newArch->entCount++;
+
+	//--- before remPos
+	for (int i = 0; i < remPos; i++) {
+		size_t size = compDescs[oldArch->componentIds[i]].size;
+		memcpy((uint8_t*)newArch->storage[i] + newSlot * size,
+		       (uint8_t*)oldArch->storage[i] + oldSlot * size, size);
+	}
+
+	//--- after remPos
+	for (int i = remPos + 1; i < oldCount; i++) {
+		size_t size = compDescs[oldArch->componentIds[i]].size;
+		memcpy((uint8_t*)newArch->storage[i-1] + newSlot * size,
+		       (uint8_t*)oldArch->storage[i] + oldSlot * size, size);
+	}
+
+	//remove entity index from old archetype
+	int last = --oldArch->entCount;
+	if (oldSlot != last) {
+		Entity lastEnt = oldArch->entities[last];
+		oldArch->entities[oldSlot] = lastEnt;
+
+		for (int i = 0; i < oldArch->compCount; i++) {
+			size_t sz = compDescs[oldArch->componentIds[i]].size;
+			memcpy((uint8_t*)oldArch->storage[i] + oldSlot * sz,
+			       (uint8_t*)oldArch->storage[i] + last * sz, sz);
+		}
+
+		entDescs[ECS_ENTITY_INDEX(lastEnt)].slot = oldSlot;
+	}
+
+	//update entity metadata
+	newArch->entities[newSlot] = ent;
+	entDescs[index].arch = newArch;
+	entDescs[index].slot = newSlot;
+}
+
+static void ecs_removeComponentDeferred(Entity ent, EcsComponent comp)
+{
+	uint32_t index = ECS_ENTITY_INDEX(ent);
+	CmdBucket *buck = &cmdBuckets[index];
+
+	//ignore if entity is scheduled to be destroyed
+	if (buck->destroy) return;
+
+	//ignore if component is neither in the arch or staged
+	Archetype *arch = entDescs[index].arch;
+	if (arch->compIndexCache[comp] < 0 &&
+	    !(buck->addMask & COMP_BIT(comp))) return;
+
+	//mark removal and disable ADD command
+	buck->remMask |= COMP_BIT(comp);
+	buck->addMask &= ~COMP_BIT(comp);
+	//disabling add does not delete staged component data
+
+	markBucketDirty(index);
+}
+
+void ecs_removeComponent(Entity ent, EcsComponent comp)
+{
+	uint32_t index = ECS_ENTITY_INDEX(ent);
+	if (entDescs[index].id != ent) return;
+
+	if (inDeferred) ecs_removeComponentDeferred(ent, comp);
+	else ecs_removeComponentImmediate(ent, comp);
+}
+
 void *ecs_getComponent(Entity ent, EcsComponent comp)
 {
 	uint32_t index = ECS_ENTITY_INDEX(ent);
 	if (entDescs[index].id != ent) return NULL;
 
+	if (!inDeferred) {
+		Archetype *arch = entDescs[index].arch;
+		int slot = entDescs[index].slot;
+
+		int cidx = arch->compIndexCache[comp];
+		if (cidx < 0) return NULL; //component not in arch
+
+		size_t size = compDescs[comp].size;
+		return (uint8_t*)arch->storage[cidx] + slot * size;
+	}
+
+	CmdBucket *buck = &cmdBuckets[index];
+
+	//ignore if schduled to destroy
+	if (buck->destroy) return NULL;
+	else if (buck->remMask & COMP_BIT(comp)) return NULL;
+	else if (buck->addMask & COMP_BIT(comp))
+		return buck->data[comp];
+
+	//check inside the current archetype
 	Archetype *arch = entDescs[index].arch;
 	int slot = entDescs[index].slot;
-
 	int cidx = arch->compIndexCache[comp];
-	if (cidx < 0) return NULL; //component not in arch
-
+	if (cidx < 0) return NULL;
 	size_t size = compDescs[comp].size;
 	return (uint8_t*)arch->storage[cidx] + slot * size;
+}
+
+static void flushCommands()
+{
+	if (!inDeferred) return;
+
+	for (int i = 0; i < dirtyCount; i++) {
+		uint32_t entIndex = dirties[i];
+		CmdBucket *buck = &cmdBuckets[entIndex];
+
+		//check if bucket is empty
+		if (!buck->destroy &&
+		    !buck->addMask &&
+		    !buck->remMask) continue;
+
+		//check entity validity
+		Entity ent = entDescs[entIndex].id;
+		if (ECS_ENTITY_INDEX(ent) != entIndex) continue;
+
+		//check for destroy flag
+		if (buck->destroy) {
+			ecs_destroyImmediate(ent);
+			continue;
+		}
+
+		uint64_t remMask = buck->remMask;
+		while (remMask) {
+			uint64_t bits = remMask;
+			uint64_t comp = 0;
+
+			while (!(bits & 01)) {
+				++comp;
+				bits>>=1;
+			}
+			remMask &= remMask - 1;
+
+			ecs_removeComponentImmediate(ent, (EcsComponent)comp);
+		}
+
+		uint64_t addMask = buck->addMask;
+		while (addMask) {
+			uint64_t bits = addMask;
+			uint64_t comp = 0;
+
+			while (!(bits & 01)) {
+				++comp;
+				bits>>=1;
+			}
+			addMask &= addMask - 1;
+
+			void *dst = ecs_addComponentImmediate(ent, (EcsComponent)comp);
+			if (dst && buck->data[comp]) {
+				size_t sz = compDescs[comp].size;
+				memcpy(dst, buck->data[comp], sz);
+			}
+		}
+	}
+}
+
+void ecs_deferBegin(void)
+{
+	if (inDeferred) return;
+
+	dirtyCount = 0;
+	memset(dirties, 0, sizeof(dirties));
+	inDeferred = true;
+}
+
+void ecs_deferEnd(void)
+{
+	if (!inDeferred) return;
+	flushCommands();
+	zon_arenaRewind(&cmdStorage, 0);
+	inDeferred = false;
 }
 
 EcsQuery *ecs_makeQuery(EcsQueryDesc desc)
@@ -313,11 +638,11 @@ EcsQuery *ecs_makeQuery(EcsQueryDesc desc)
 	q->includeCount = desc.includeCount;
 
 	for (int i = 0; i < desc.includeCount; i++) {
-		q->include |= (1ULL << desc.include[i]);
+		q->include |= COMP_BIT(desc.include[i]);
 		q->includeList[i] = desc.include[i];
 	}
 	for (int i = 0; i < desc.excludeCount; i++)
-		q->exclude |= (1ULL << desc.exclude[i]);
+		q->exclude |= COMP_BIT(desc.exclude[i]);
 
 	for (int i = 0; i < archCount; i++) {
 		Archetype *arch = &archetypes[i];

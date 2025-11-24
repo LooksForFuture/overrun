@@ -65,6 +65,12 @@ void ecs_init(void);
 /* free up resources used */
 void ecs_shutdown(void);
 
+/* enter deferred mode */
+void ecs_deferBegin(void);
+
+/* exit deferred mode */
+void ecs_deferEnd(void);
+
 /* register a component (returns an id) */
 EcsComponent ecs_registerComponent(size_t, size_t);
 
@@ -77,8 +83,8 @@ bool ecs_isValid(Entity);
 /* create an empty entity */
 Entity ecs_newEntity(void);
 
-/* destroy and entity (makes it invalid) */
-void ecs_destroyEntity(Entity);
+/* destroy the entity (makes it invalid) */
+void ecs_destroy(Entity);
 
 /* create an entity in the specified archetype */
 Entity ecs_newEntityInArch(Archetype *);
@@ -88,6 +94,9 @@ Archetype *ecs_getEntityArch(Entity);
 
 /* add a component to an entity (changes archetype) */
 void *ecs_addComponent(Entity, EcsComponent);
+
+/* remove component from entity */
+void ecs_removeComponent(Entity, EcsComponent);
 
 /* get component if available */
 void *ecs_getComponent(Entity, EcsComponent);
