@@ -7,6 +7,26 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+Currently there are some hard static limits to the ECS which may turn
+dynamic in the next versions
+
+Entities are stored in a static array and are treated as a free list pool
+When an Entity is not alive, its id would be the index of the next free
+entity. The last free entity would have UINT32_MAX as its index to
+indicate that there is no more free entities
+
+During the deferred mode, all the operations done on the components are
+stored in an arena which would be then applied on the main storage. The
+arena gets cleaned up at the end of deferred mode
+
+An entity with NULL archetype record means it has been created in
+deferred mode and has not been put in an archetype (not implemented yet)
+these entities do not get processed by queries and systems until the
+flush puts them in an archetype (invisiable to queries)
+ */
+
+/* static limits */
 #define MAX_ENTITY_COUNT 1024
 #define MAX_COMPONENT_COUNT 64
 #define MAX_ARCHETYPE_COUNT 128
@@ -15,7 +35,13 @@
 
 #define CREATE_ENTITY(i, g) (((uint64_t)(i) << 32) | (g))
 
-// entity id to bitmask
+/*
+  Due to the fact that there would be only 64 components at max,
+  we can write our filters as bitmasks with each component id being
+  a bit of the bitmask
+ */
+
+// component id to bitmask
 #define COMP_BIT(c) (1ULL << (c))
 
 //a bitmask with each bit representing a component
@@ -56,10 +82,10 @@ typedef struct {
 	bool destroy; //entity must die
 	EcsMask addMask; //bit mask of components to add
 	EcsMask remMask; //bit mask of components to remove
-	void *data[64]; //pointer to component staged data
+	void *data[MAX_COMPONENT_COUNT]; //pointer to staged comp data
 } CmdBucket;
 
-// where we store ECS data and free on shutdown
+// where we store component data and free on shutdown
 static ZonArena ecsStorage;
 // for storing staged components data
 static ZonArena cmdStorage;
@@ -67,10 +93,11 @@ static ZonArena cmdStorage;
 static int entCount = 0; // number of alive entities
 static EntityDesc entDescs[MAX_ENTITY_COUNT];
 static uint32_t nextFreeEntity = 0;
+
 static CmdBucket cmdBuckets[MAX_ENTITY_COUNT];
 //entities to be processed at flush
 static uint32_t dirties[MAX_ENTITY_COUNT];
-static size_t dirtyCount = 0;
+static size_t dirtyCount = 0; //how many buckets to process at flush
 
 static int compCount = 0;
 static ComponentDesc compDescs[MAX_COMPONENT_COUNT];
@@ -87,7 +114,8 @@ static Archetype *emptyArch = NULL; //empty arch for empty entities
 
 void ecs_init(void)
 {
-	for (uint32_t i = 0; i < MAX_ENTITY_COUNT; i++) {
+	//mark all entities as free
+	for (uint32_t i = 0; i < MAX_ENTITY_COUNT - 1; i++) {
 		entDescs[i].id = CREATE_ENTITY(i + 1, 0);
 		entDescs[i].arch = NULL;
 		entDescs[i].slot = -1;
@@ -135,6 +163,8 @@ Archetype *ecs_registerArchetype(EcsComponent *components, size_t count)
 
 	Archetype *arch = &archetypes[archCount++];
 	arch->mask = 0;
+
+	//write every index cache to -1 to signify it's absence
 	for (int i = 0; i < MAX_COMPONENT_COUNT; ++i)
 		arch->compIndexCache[i] = -1;
 
@@ -144,8 +174,9 @@ Archetype *ecs_registerArchetype(EcsComponent *components, size_t count)
 		arch->componentIds[i] = comp;
 		arch->mask |= COMP_BIT(comp);
 		arch->storage[i] =
-			zon_arenaMalloc(&ecsStorage,
-					MAX_ARCH_ENTITY * desc.size);
+			zon_arenaAlloc(&ecsStorage,
+				       MAX_ARCH_ENTITY * desc.size,
+				       desc.alignment);
 		arch->compIndexCache[comp] = i;
 	}
 	arch->compCount = count;

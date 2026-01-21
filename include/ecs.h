@@ -1,6 +1,25 @@
 #ifndef __ECS_MAIN__
 #define __ECS_MAIN__
 
+/*
+  ECS subsystem
+
+Each entity is a 64-bit identifier
+Components are 64-bit identifiers
+
+Entities, components, archetypes, etc do not reside in the same namespace
+like how flecs treats everything as enities
+
+Any entity consists of two 32 bits. One 32-bits for entity id and the
+other for generation
+
+There is a custom macro ECS_ID which generates ECS__##name for the given
+name which is used for handle declerations
+
+Definition of some structs has not been done in the header for 2 reasons:
+1. Private members in structs - 2. Left some freedom for the C file
+ */
+
 #include <map.h>
 
 #include <stdalign.h>
@@ -51,6 +70,11 @@ typedef struct {
 	int excludeCount;
 } EcsQueryDesc;
 
+/*
+  an iterator would be used as a handle for iterationg over queries
+  this has been done to keep users from modifying the query members and
+  also to cache component handles for iteration
+ */
 typedef struct {
 	EcsQuery *query;
 	Entity entity;

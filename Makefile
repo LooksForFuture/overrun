@@ -1,37 +1,27 @@
-# Compiler settings
-CC = gcc
-CFLAGS = -Wall -Wpedantic -g -std=c11 -I./include
-
-# Directories
-SUBMOD_DIR = submodules
-SRC_DIR = src
 BIN_DIR = bin
 
-# Include flags
-CFLAGS += -I$(SUBMOD_DIR)/zoner/include
+default: build-run
 
-# Link flags
-LDFLAGS = $(SUBMOD_DIR)/zoner/build/libzoner.a
-
-# Source files
-SRC_FILES = $(wildcard $(SRC_DIR)/*.c)
-
-# Target executable
-TARGET = game
-
-# Build the game and Zoner
-all: build run
+ready:
+	mkdir -p $(BIN_DIR)/
+	cd $(BIN_DIR)/ &&\
+	cmake .. -G Ninja
 
 build:
-	mkdir -p $(BIN_DIR)/
-	$(CC) $(CFLAGS) $(SRC_FILES) $(LDFLAGS) -o $(BIN_DIR)/$(TARGET)
+	cd $(BIN_DIR)/ &&\
+	cmake --build .
 
-# Clean up
-clean:
-	rm -rf $(BIN_DIR)/*
-
-# Run the game
 run:
-	cd $(BIN_DIR)/ && ./$(TARGET)
+	cd $(BIN_DIR)/ && \
+	./game
 
-.PHONY: build clean run
+build-run:
+	cd $(BIN_DIR)/ && \
+	cmake --build . && \
+	./game
+
+test-ryu:
+	cd $(BIN_DIR)/engine/ryu/ && \
+	ctest --output-on-failure
+
+.PHONY: ready build run build-run test-ryu
