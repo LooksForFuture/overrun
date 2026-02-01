@@ -1,7 +1,14 @@
+/*
+  This test unit is for testing the deterministic behavior of the library
+ */
+
 #include <ryu/ryu.h>
 #include <ryu/init.h>
 
 #include <assert.h>
+
+#define CREATE_WORLD(i, g) (((uint32_t)(i) << 8) | (g))
+#define CREATE_ENTITY(i, g, w) (((uint64_t)(i) << 32)|((uint16_t)(g) << 16)|(w))
 
 #define INIT_WORLD_CHECK(world, index, generation) \
 assert(RYU_WORLD_INDEX(world) == index); \
@@ -63,6 +70,12 @@ int main(void)
 	world2 = ryu_newWorld();
 	INIT_WORLD_CHECK(world2, 1, 3);
 
+	for (int i = 0; i < 32; i++) {
+		ryu_newWorld();
+	}
+
+	assert(!ryu_isWorldValid(CREATE_WORLD(255, 999)));
+
 	/* test entities */
 	Entity ent1_1 = ryu_newEntity(world);
 	INIT_ENTITY_CHECK(ent1_1, 0, 1, world);
@@ -99,6 +112,17 @@ int main(void)
 	ryu_destroyEntity(ent2_1);
 	assert(ryu_isEntityValid(ent2_1));
 	assert(ryu_isEntityPending(ent2_1));
+	ryu_destroyEntity(ent2_1); //shouldn't have a problem
+
+	ryu_flush(world);
+
+	assert(!ryu_isEntityValid(ent2_1));
+	assert(!ryu_isEntityPending(ent2_1));
+	ryu_destroyEntity(ent2_1);
+	assert(!ryu_isEntityValid(ent2_1));
+	assert(!ryu_isEntityPending(ent2_1));
+
+	assert(!ryu_isEntityValid(CREATE_ENTITY(264, 0, world)));
 
 	ryu_shutdown();
 	return 0;

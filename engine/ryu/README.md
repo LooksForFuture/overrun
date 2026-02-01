@@ -21,4 +21,4 @@ World handles are 16-bit unsigned integers. 8 for entity ID and 8 for the genera
 Entities are the units of existence in Ryu. Each entity is identified by its ID, and the world which it belongs to. Entities have no behaviour by themselves and simply exist. Entity handles are 64-bit unsigned integers with 32 bits for ID, 16 for generation counting and 16 for the world handle. One can extract the world handle directly from the entity.
 
 ### Flush
-Ryu, does not destroy entities or remove components from entities immidately. Instead, it stores them in a list and waits until flush points. At the flush points, Ryu walks over the list, removes the components and then destroys the entities that are pending to be destroyed.
+Ryu, does not destroy entities or remove components from entities immidately. Instead, it stores them in a list and waits until flush points. At flush points, Ryu walks over the list, removes the components and then destroys the entities that are pending to be destroyed.

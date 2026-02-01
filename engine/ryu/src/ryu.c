@@ -1,5 +1,8 @@
 #include <ryu/ryu.h>
 #include <ryu/init.h>
+#include <ryu/component.h>
+
+#include <glut/glut.h>
 
 #include <assert.h>
 #include <stdbool.h>
@@ -18,9 +21,23 @@
 #define CREATE_WORLD(i, g) (((uint32_t)(i) << 8) | (g))
 #define CREATE_ENTITY(i, g, w) (((uint64_t)(i) << 32)|((uint16_t)(g) << 16)|(w))
 
+typedef struct Archetype {
+	int componentCount;
+	int *components;
+	int entityCount;
+	int entitiesAllocated;
+	Entity *entities;
+
+	int nSibling; //next arch with same the hash
+	int pSibling; //previous arch with the same hash
+} Archetype;
+
 typedef struct {
 	Entity id;
 	bool pending;
+
+	int arch; //the archetype it belongs to
+	int archIndex; //index in archetype
 } EntityDesc;
 
 typedef struct {
@@ -35,9 +52,12 @@ static uint8_t worldCount = 0;
 static World *worlds = NULL;
 static uint8_t stagedWorld = 0;
 
+//will also be used for commponent id
+static int componentCount = 0;
+
 void ryu_init(void)
 {
-	worlds = malloc(RYU_INIT_WORLD_COUNT * sizeof(World));
+	worlds = glut_malloc(RYU_INIT_WORLD_COUNT * sizeof(World));
 	worldCount = RYU_INIT_WORLD_COUNT;
 
 	for (uint8_t i = 0; i < worldCount - 1; i++) {
@@ -46,7 +66,7 @@ void ryu_init(void)
 		worlds[i].entities = NULL;
 		worlds[i].stagedEntity = 0;
 	}
-	worlds[worldCount].id = CREATE_WORLD(UINT8_MAX, 0);
+	worlds[worldCount-1].id = CREATE_WORLD(UINT8_MAX, 0);
 	stagedWorld = 0;
 }
 
@@ -54,9 +74,9 @@ void ryu_shutdown(void)
 {
 	for (uint8_t i = 0; i < worldCount; i++) {
 		World *world = &worlds[i];
-		free(world->entities);
+		glut_free(world->entities);
 	}
-	free(worlds);
+	glut_free(worlds);
 }
 
 RyuWorld ryu_newWorld(void)
@@ -64,7 +84,20 @@ RyuWorld ryu_newWorld(void)
 	RyuWorld worldHandle = CREATE_WORLD(UINT8_MAX, 0);
 
 	if (stagedWorld == UINT8_MAX) {
-		//no free worlds, allocate more
+		World *p = glut_realloc(worlds, worldCount*2*sizeof(World));
+		if (!p) return worldHandle;
+
+		worlds = p;
+		uint8_t pCount = worldCount;
+		worldCount *= 2;
+		for (uint8_t i = pCount; i < worldCount - 1; i++) {
+			worlds[i].id = CREATE_WORLD(i + 1, 0);
+			worlds[i].entityCount = 0;
+			worlds[i].entities = NULL;
+			worlds[i].stagedEntity = 0;
+		}
+		worlds[worldCount-1].id = CREATE_WORLD(UINT8_MAX, 0);
+		stagedWorld = pCount;
 	}
 
 	World *world = &worlds[stagedWorld];
@@ -81,15 +114,18 @@ RyuWorld ryu_newWorld(void)
 	worldHandle = world->id;
 
 	/* allocate and setup entities */
-	world->entities = malloc(RYU_INIT_ENTITY_COUNT * sizeof(EntityDesc));
+	world->entities = glut_malloc(RYU_INIT_ENTITY_COUNT
+				      * sizeof(EntityDesc));
 	world->entityCount = RYU_INIT_ENTITY_COUNT;
 
 	for (uint32_t i = 0; i < world->entityCount - 1; i++) {
 		EntityDesc *desc = &world->entities[i];
 		desc->id = CREATE_ENTITY(i + 1, 0, worldHandle);
+		desc->pending = false;
 	}
-	world->entities[world->entityCount].id =
-		CREATE_ENTITY(UINT32_MAX, 0, worldHandle);
+	EntityDesc *desc = &world->entities[world->entityCount-1];
+	desc->id = CREATE_ENTITY(UINT32_MAX, 0, worldHandle);
+	desc->pending = false;
 	world->stagedEntity = 0;
 
 	return worldHandle;
@@ -98,7 +134,7 @@ RyuWorld ryu_newWorld(void)
 bool ryu_isWorldValid(RyuWorld handle)
 {
 	uint8_t index = RYU_WORLD_INDEX(handle);
-	if (index > worldCount || index == UINT8_MAX) return false;
+	if (index >= worldCount || index == UINT8_MAX) return false;
 	World *world = &worlds[index];
 	return world->id == handle;
 }
@@ -106,12 +142,12 @@ bool ryu_isWorldValid(RyuWorld handle)
 void ryu_destroyWorld(RyuWorld handle)
 {
 	uint8_t index = RYU_WORLD_INDEX(handle);
-	if (index > worldCount || index == UINT8_MAX) return;
+	if (index >= worldCount || index == UINT8_MAX) return;
 	World *world = &worlds[index];
 	if (world->id != handle) return;
 
 	/* TODO: destruct components, blah blah blah */
-	free(world->entities);
+	glut_free(world->entities);
 	world->id = CREATE_WORLD(stagedWorld,
 				 RYU_WORLD_GENERATION(world->id));
 	stagedWorld = index;
@@ -123,18 +159,34 @@ Entity ryu_newEntity(RyuWorld worldHandle)
 	Entity handle = CREATE_ENTITY(UINT32_MAX, 0, worldHandle);
 
 	uint8_t worldIndex = RYU_WORLD_INDEX(worldHandle);
-	if (worldIndex > worldCount || worldIndex == UINT8_MAX) return handle;
+	if (worldIndex >= worldCount || worldIndex == UINT8_MAX) return handle;
 	World *world = &worlds[worldIndex];
 	if (world->id != worldHandle) return handle;
 
 	if (world->stagedEntity == UINT32_MAX) {
-		//no free entities, allocate
+		EntityDesc *p = glut_realloc(world->entities,
+					     world->entityCount * 2 *
+					     sizeof(EntityDesc));
+		if (!p) return handle;
+
+		world->entities = p;
+		uint32_t pCount = world->entityCount;
+		world->entityCount *= 2;
+		for (uint32_t i = pCount; i < world->entityCount - 1; i++) {
+			EntityDesc *desc = &world->entities[i];
+			desc->id = CREATE_ENTITY(i + 1, 0, worldHandle);
+			desc->pending = false;
+		}
+		EntityDesc *desc = &world->entities[world->entityCount-1];
+		desc->id = CREATE_ENTITY(UINT32_MAX, 0, worldHandle);
+		desc->pending = false;
+		world->stagedEntity = pCount;
 	}
 
 	EntityDesc *desc = &world->entities[world->stagedEntity];
 
 	/* if the id of an entity desc is pointing to its actual index,
-	 it means that it's not free */
+	   it means that it's not free */
 	assert(RYU_ENTITY_INDEX(desc->id)!=world->stagedEntity &&
 	       "attempting to use a non free world");
 	uint32_t index = world->stagedEntity;
@@ -152,12 +204,12 @@ bool ryu_isEntityValid(Entity handle)
 {
 	RyuWorld worldHandle = RYU_ENTITY_WORLD(handle);
 	uint8_t worldIndex = RYU_WORLD_INDEX(worldHandle);
-	if (worldIndex > worldCount || worldIndex == UINT8_MAX) return false;
+	if (worldIndex >= worldCount || worldIndex == UINT8_MAX) return false;
 	World *world = &worlds[worldIndex];
 	if (world->id != worldHandle) return false;
 
 	uint32_t index = RYU_ENTITY_INDEX(handle);
-	if (index > world->entityCount || index == UINT32_MAX) return false;
+	if (index >= world->entityCount || index == UINT32_MAX) return false;
 	EntityDesc *desc = &world->entities[index];
 	return desc->id == handle;
 }
@@ -166,12 +218,12 @@ void ryu_destroyEntity(Entity handle)
 {
 	RyuWorld worldHandle = RYU_ENTITY_WORLD(handle);
 	uint8_t worldIndex = RYU_WORLD_INDEX(worldHandle);
-	if (worldIndex > worldCount || worldIndex == UINT8_MAX) return;
+	if (worldIndex >= worldCount || worldIndex == UINT8_MAX) return;
 	World *world = &worlds[worldIndex];
 	if (world->id != worldHandle) return;
 
 	uint32_t index = RYU_ENTITY_INDEX(handle);
-	if (index > world->entityCount || index == UINT32_MAX) return;
+	if (index >= world->entityCount || index == UINT32_MAX) return;
 	EntityDesc *desc = &world->entities[index];
 	if (desc->id != handle) return;
 
@@ -182,12 +234,12 @@ bool ryu_isEntityPending(Entity handle)
 {
 	RyuWorld worldHandle = RYU_ENTITY_WORLD(handle);
 	uint8_t worldIndex = RYU_WORLD_INDEX(worldHandle);
-	if (worldIndex > worldCount || worldIndex == UINT8_MAX) return false;
+	if (worldIndex >= worldCount || worldIndex == UINT8_MAX) return false;
 	World *world = &worlds[worldIndex];
 	if (world->id != worldHandle) return false;
 
 	uint32_t index = RYU_ENTITY_INDEX(handle);
-	if (index > world->entityCount || index == UINT32_MAX) return false;
+	if (index >= world->entityCount || index == UINT32_MAX) return false;
 	EntityDesc *desc = &world->entities[index];
 	if (desc->id != handle) return false;
 
@@ -198,6 +250,7 @@ bool ryu_isEntityPending(Entity handle)
 static void destroyEntityImmediate(EntityDesc *desc, uint32_t entityIndex,
 				   World *world)
 {
+	assert(desc->pending && "attempting to delete a on pending entity");
 	/* TODO: destruct components */
 	desc->id = CREATE_ENTITY(world->stagedEntity,
 				 RYU_ENTITY_GENERATION(desc->id),
@@ -209,7 +262,7 @@ static void destroyEntityImmediate(EntityDesc *desc, uint32_t entityIndex,
 void ryu_flush(RyuWorld worldHandle)
 {
 	uint8_t worldIndex = RYU_WORLD_INDEX(worldHandle);
-	if (worldIndex > worldCount || worldIndex == UINT8_MAX) return;
+	if (worldIndex >= worldCount || worldIndex == UINT8_MAX) return;
 	World *world = &worlds[worldIndex];
 	if (world->id != worldHandle) return;
 
@@ -220,4 +273,10 @@ void ryu_flush(RyuWorld worldHandle)
 			destroyEntityImmediate(desc, i, world);
 		}
 	}
+}
+
+int ryu_regComponent()
+{
+	return componentCount++;
+
 }
